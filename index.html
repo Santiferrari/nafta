@@ -382,11 +382,15 @@ async function claude(prompt,o){
   o=o||{};var content=[],imgs=o.images||[];
   for(var i=0;i<imgs.length;i++)content.push({type:"image",source:{type:"base64",media_type:imgs[i].type||"image/jpeg",data:await b64(imgs[i])}});
   content.push({type:"text",text:prompt});
+  /* Los modelos nuevos piensan antes de responder y ese razonamiento cuenta dentro de max_tokens:
+     con un tope chico la respuesta llega cortada. El largo se controla desde el prompt. */
+  var body={model:A.modelo,max_tokens:16000,messages:[{role:"user",content:content}]};
+  if(o.schema)body.output_config={format:{type:"json_schema",schema:o.schema}};
+  var headers={"content-type":"application/json","x-api-key":A.key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"};
+  if(CON_FALLBACK.indexOf(A.modelo)>=0){body.fallbacks="default";headers["anthropic-beta"]="server-side-fallback-2026-07-01"}
   var r;
   try{
-    r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",signal:o.signal,
-      headers:{"content-type":"application/json","x-api-key":A.key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model:A.modelo,max_tokens:o.max||1500,messages:[{role:"user",content:content}]})});
+    r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",signal:o.signal,headers:headers,body:JSON.stringify(body)});
   }catch(e){throw{code:(e&&e.name==="AbortError")?"cancelled":"red"}}
   var j=null;try{j=await r.json()}catch(e){}
   if(!r.ok){
@@ -398,14 +402,23 @@ async function claude(prompt,o){
     throw{code:c,message:msg};
   }
   var txt=((j&&j.content)||[]).filter(function(b){return b.type==="text"}).map(function(b){return b.text}).join("").trim();
+  if(j&&j.stop_reason==="refusal")throw{code:"refused"};
+  if(j&&j.stop_reason==="max_tokens"){console.warn("Nafta: respuesta cortada por max_tokens",j.usage);throw{code:"cortado"}}
   if(!txt)throw{code:"refused"};
   return txt;
 }
 function aJSON(txt){
   var t=txt.replace(/```(?:json)?/gi,"").trim(),a=t.indexOf("{"),b=t.lastIndexOf("}");
-  if(a<0||b<=a)throw{code:"invalid_json"};
-  try{return JSON.parse(t.slice(a,b+1))}catch(e){throw{code:"invalid_json"}}
+  if(a<0||b<=a){console.warn("Nafta: Claude no devolvió JSON:",txt);throw{code:"invalid_json"}}
+  try{return JSON.parse(t.slice(a,b+1))}catch(e){console.warn("Nafta: JSON inválido de Claude:",txt);throw{code:"invalid_json"}}
 }
+/* Modelos que aceptan el respaldo automático del servidor si el principal rechaza el pedido. */
+var CON_FALLBACK=["claude-opus-5-5","claude-fable-5-2","claude-fable-5-1","claude-opus-5","claude-sonnet-5-5"];
+/* Formatos JSON que la API garantiza (structured outputs). */
+function obj(p){return{type:"object",properties:p,required:Object.keys(p),additionalProperties:false}}
+var STR={type:"string"},INT={type:"integer"};
+var SCH_PLATO=obj({nombre:STR,items:{type:"array",items:obj({nombre:STR,porcion:STR,kcal:INT,prot:INT,carb:INT,grasa:INT})},puntaje:INT,nota:STR});
+var SCH_PLAN=obj({resumen:STR,comidas:{type:"array",items:obj({tipo:STR,nombre:STR,detalle:STR,kcal:INT,prot:INT,carb:INT,grasa:INT})}});
 function activar(){
   sample=A.key?{json:async function(p,o){return aJSON(await claude(p,o))},texto:claude}:null;
   puedeFoto=!!sample;
@@ -579,6 +592,7 @@ var COPY={
   sampling_disabled:"Claude no está disponible en esta cuenta. Podés cargar a mano.",
   images_unavailable:"Acá no se pueden mandar fotos a Claude. Describí la comida por escrito.",
   invalid_json:"Claude contestó algo que no pude leer. Probá de nuevo.",
+  cortado:"La respuesta de Claude llegó incompleta. Probá de nuevo o elegí otro modelo en Ajustes.",
   key:"Tu API key de Claude no funciona. Revisala en Ajustes (el engranaje de arriba).",
   modelo:"Ese modelo no está disponible para tu key. Elegí otro en Ajustes.",
   saldo:"Tu cuenta de API no tiene crédito disponible. Revisalo en la consola de Anthropic.",
@@ -591,7 +605,7 @@ async function analizar(){
   estado("pens");
   ctl=new AbortController();
   try{
-    var opts={signal:ctl.signal,cache:false};
+    var opts={signal:ctl.signal,cache:false,schema:SCH_PLATO};
     if(E.blob)opts.images=[E.blob];
     var r=await sample.json(armarPrompt(),opts);
     var items=(r&&Array.isArray(r.items)?r.items:[]).slice(0,12).map(function(it){
@@ -814,7 +828,7 @@ $("recoBtn").onclick=async function(){
     "Escribí en español rioplatense, texto plano sin markdown, sin asteriscos y sin títulos, máximo 170 palabras, en este orden: una línea de cómo viene el día respecto de la meta; tres opciones concretas y fáciles de conseguir para su próxima comida que entren en lo que le queda, cada una en su renglón con kcal y proteína aproximadas; y un consejo corto atado a su entrenamiento (si entrenó hoy, si le toca mañana, o descanso). Si faltan datos, decilo en una frase y recomendá igual. No des consejos médicos.";
   try{
     recoCtl=new AbortController();
-    var t=await sample.texto(p,{signal:recoCtl.signal,max:700});
+    var t=await sample.texto(p,{signal:recoCtl.signal});
     out.className="reco";out.textContent=t.replace(/\*\*/g,"");
     diaDe(hoy()).reco=out.textContent;guardarDia(hoy());
   }catch(e){
@@ -868,7 +882,7 @@ $("planBtn").onclick=async function(){
     "Reglas: proponé UN plato por cada comida que falta. La suma de los platos tiene que acercarse a lo que le queda (dentro de un 10%), priorizando llegar a la proteína sin pasarse de calorías. Repartí según el momento del día y el entrenamiento (más carbos cerca de entrenar). Si ya se pasó de calorías, proponé algo liviano y alto en proteína y decilo en resumen. Platos simples, con ingredientes comunes en Argentina, con cantidades en gramos o unidades.\n"+
     'Respondé SOLO con JSON, en español, números enteros, con esta forma:\n{"resumen":"una frase corta sobre el plan","comidas":[{"tipo":"Cena","nombre":"nombre del plato","detalle":"ingredientes con cantidades, ej: 200 g de pollo, 150 g de arroz cocido, ensalada","kcal":0,"prot":0,"carb":0,"grasa":0}]}';
   try{
-    var r=await sample.json(p,{max:1400});
+    var r=await sample.json(p,{schema:SCH_PLAN});
     var cs=(r&&Array.isArray(r.comidas)?r.comidas:[]).slice(0,5).map(function(x){return{tipo:String(x.tipo||f[0]).slice(0,20),nombre:String(x.nombre||"Plato").slice(0,80),detalle:String(x.detalle||"").slice(0,240),kcal:R(num(x.kcal)),prot:R(num(x.prot)),carb:R(num(x.carb)),grasa:R(num(x.grasa))}});
     if(!cs.length)throw{code:"invalid_json"};
     diaDe(hoy()).plan={resumen:String((r&&r.resumen)||"").slice(0,240),comidas:cs};guardarDia(hoy());pintarPlan();
